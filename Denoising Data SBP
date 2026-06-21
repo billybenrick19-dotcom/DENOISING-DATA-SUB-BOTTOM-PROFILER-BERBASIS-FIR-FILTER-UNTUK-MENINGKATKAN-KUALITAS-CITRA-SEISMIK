@@ -1,0 +1,167 @@
+# ================================================================
+# 0. IMPORT LIBRARIES
+# ================================================================
+import numpy as np
+from obspy.io.segy.segy import _read_segy
+from scipy.signal import firwin, filtfilt
+import segyio
+import os
+import csv
+
+# ================================================================
+# 1. KONFIGURASI NAMA FILE
+# ================================================================
+base_name = "ML-TRM24-"  # contoh: ML-TRM-24-01.sgy
+start_line = 1
+end_line   = 31
+
+# ================================================================
+# 2. OUTPUT FOLDER
+# ================================================================
+output_folder = "Coba2"
+os.makedirs(output_folder, exist_ok=True)
+
+snr_csv = f"{output_folder}/SNR_results.csv"
+with open(snr_csv, "w", newline="") as f:
+    writer = csv.writer(f)
+    writer.writerow(["Line", "Filter", "Parameters", "SNR_dB"])
+
+
+def log_snr(line_no, name, params, snr_val):
+    with open(snr_csv, "a", newline="") as f:
+        csv.writer(f).writerow([line_no, name, params, snr_val])
+
+
+# ================================================================
+# 3. BANDPASS FILTER SETTINGS
+# ================================================================
+fs = 8000
+numtaps = 101
+bp_low  = 800
+bp_high = 2000
+
+def fir_bandpass(data, low, high):
+    b = firwin(numtaps, [low, high], fs=fs, pass_zero=False, scale=True)
+    return filtfilt(b, 1.0, data, axis=1)
+
+
+# ================================================================
+# 5. SAVE TO SEGY
+# ================================================================
+def save_to_segy(output_path, original_path, new_data):
+    new_data = new_data.astype(np.float32)
+    with segyio.open(original_path, "r", ignore_geometry=True) as src:
+        spec = segyio.spec()
+        spec.sorting    = src.sorting
+        spec.format     = src.format
+        spec.samples    = src.samples
+        spec.tracecount = len(src.trace)
+
+        with segyio.create(output_path, spec) as dst:
+            dst.bin = src.bin
+            for i in range(spec.tracecount):
+                dst.header[i] = src.header[i]
+                dst.trace[i]  = new_data[i]
+            dst.flush()
+
+    print(f"✔ File dibuat: {output_path}")
+
+
+# ================================================================
+# 6. DETEKSI SEABED & MUTE
+# ================================================================
+def detect_seabed(trace, search_start=200):
+    env = np.abs(trace)
+    smooth = np.convolve(env, np.ones(15)/15, mode="same")
+
+    thresh = 0.4 * np.max(smooth)   # ambil seabed sebagai 40% amplitude tertinggi
+
+    for i in range(search_start, len(trace)):
+        if smooth[i] > thresh:
+            return i
+    return np.argmax(smooth)  # fallback
+
+def apply_mute(data, seabed_idx):
+    out = data.copy()
+    for i in range(data.shape[0]):
+        out[i, :seabed_idx[i]] = 0
+    return out
+
+
+# ================================================================
+# 7. SNR POST-SEABED
+# ================================================================
+POST_NOISE_OFFSET = 10
+NOISE_LEN = 100
+SIGNAL_LEN = 200
+
+def snr_db_post_seabed(data, seabed_idx):
+    snr_list = []
+    n_traces, n_samples = data.shape
+
+    for i in range(n_traces):
+        sb = seabed_idx[i]
+
+        noise_start  = sb + POST_NOISE_OFFSET
+        noise_end    = noise_start + NOISE_LEN
+        signal_start = noise_end
+        signal_end   = signal_start + SIGNAL_LEN
+
+        if signal_end >= n_samples:
+            continue
+
+        noise  = data[i, noise_start:noise_end]
+        signal = data[i, signal_start:signal_end]
+
+        n_power = np.mean(noise**2)
+        s_power = np.mean(signal**2)
+        if n_power == 0:
+            continue
+
+        snr_db = 10 * np.log10(s_power / n_power)
+        snr_list.append(snr_db)
+
+    return np.mean(snr_list)
+
+
+# ================================================================
+# 8. LOOP PROSES UNTUK 1–31 LINE
+# ================================================================
+for line_no in range(start_line, end_line + 1):
+
+    filename = f"{base_name}{line_no:02d}.sgy"
+    print("\n===============================================")
+    print(f"▶ MEMPROSES LINE {line_no}: {filename}")
+    print("===============================================")
+
+    if not os.path.exists(filename):
+        print(f"⚠ File tidak ditemukan: {filename} — dilewati")
+        continue
+
+    # Load SEGY
+    segy = _read_segy(filename)
+    data = np.array([tr.data for tr in segy.traces], dtype=float)
+
+    # Seabed detection
+    seabed_idx = np.array([detect_seabed(t) for t in data])
+
+    # SNR RAW
+    snr_raw = snr_db_post_seabed(data, seabed_idx)
+    print(f"RAW SNR Line {line_no} = {snr_raw:.3f} dB")
+    log_snr(line_no, "RAW", "-", snr_raw)
+
+    # Bandpass filtering
+    filtered = fir_bandpass(data, bp_low, bp_high)
+    muted    = apply_mute(filtered, seabed_idx)
+
+    # SNR filtered
+    snr_val = snr_db_post_seabed(filtered, seabed_idx)
+    print(f"Filtered SNR Line {line_no} = {snr_val:.3f} dB")
+    log_snr(line_no, "Bandpass", f"{bp_low}-{bp_high}", snr_val)
+
+    # Save output
+    save_to_segy(f"{output_folder}/L{line_no:02d}_bandpass.sgy", filename, filtered)
+    save_to_segy(f"{output_folder}/L{line_no:02d}_bandpass_mute.sgy", filename, muted)
+
+print("\n✔ SELESAI MEMPROSES 31 LINE!")
+print(f"Semua hasil disimpan di folder: {output_folder}")
